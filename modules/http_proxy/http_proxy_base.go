@@ -14,6 +14,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/bettercap/bettercap/v2/firewall"
@@ -52,10 +54,24 @@ type HTTPProxy struct {
 
 	jsHook      string
 	isTLS       bool
-	isRunning   bool
+	isRunning   atomic.Bool
 	doRedirect  bool
 	sniListener net.Listener
 	tag         string
+
+	adaptive         bool
+	ca               *tls.Certificate
+	upstreamTimeout  time.Duration
+	passthroughTTL   time.Duration
+	passthroughMu    sync.RWMutex
+	passthrough      map[string]passthroughMark
+	silentHandshakes map[string]*silentHandshakeState
+	stats            *httpsStatsCollector
+	prewarmDomains   []string
+	prewarmMax       int
+	upstreamPort     int
+	started          chan struct{}
+	startOnce        sync.Once
 }
 
 func stripPort(s string) string {
@@ -64,6 +80,18 @@ func stripPort(s string) string {
 		return s
 	}
 	return s[:ix]
+}
+
+// splitHostPort parses "host[:port]" including bracketed IPv6 literals,
+// falling back to defaultPort when no port is present or parsing fails.
+func splitHostPort(host string, defaultPort int) (string, int) {
+	if h, p, err := net.SplitHostPort(host); err == nil {
+		if port, err := strconv.Atoi(p); err == nil {
+			return h, port
+		}
+		return h, defaultPort
+	}
+	return strings.Trim(host, "[]"), defaultPort
 }
 
 type dummyLogger struct {
@@ -86,6 +114,14 @@ func NewHTTPProxy(s *session.Session, tag string) *HTTPProxy {
 		Blacklist:  make([]string, 0),
 		Whitelist:  make([]string, 0),
 		tag:        session.AsTag(tag),
+
+		upstreamTimeout: btls.DefaultUpstreamTimeout,
+		passthroughTTL:  defaultPassthroughTTL,
+		passthrough:     make(map[string]passthroughMark),
+		stats:           newHTTPSStatsCollector(),
+		prewarmMax:      32,
+		upstreamPort:    443,
+		started:         make(chan struct{}),
 	}
 
 	p.Proxy.Verbose = false
@@ -101,11 +137,47 @@ func NewHTTPProxy(s *session.Session, tag string) *HTTPProxy {
 		}
 	})
 
-	p.Proxy.OnRequest().HandleConnect(goproxy.AlwaysMitm)
+	p.Proxy.OnRequest().HandleConnect(goproxy.FuncHttpsHandler(p.onConnect))
 	p.Proxy.OnRequest().DoFunc(p.onRequestFilter)
 	p.Proxy.OnResponse().DoFunc(p.onResponseFilter)
 
 	return p
+}
+
+// onConnect is the CONNECT decision for the default (non adaptive) mode. It
+// preserves goproxy's always-MITM behavior, but when no certificate can be
+// issued for the host it degrades to a plain tunnel instead of failing the
+// connection, and records the connection as not decrypted.
+func (p *HTTPProxy) onConnect(host string, ctx *goproxy.ProxyCtx) (*goproxy.ConnectAction, string) {
+	if p.adaptive || !p.isTLS {
+		// Adaptive mode handles everything itself in httpsWorker. The plain
+		// http.proxy module has no proxy CA configured, so it keeps goproxy's
+		// built-in always-MITM behavior.
+		return goproxy.MitmConnect, host
+	}
+
+	hostname, port := splitHostPort(host, 443)
+
+	if p.ca == nil {
+		reason := "certificate issuance failed: missing certificate authority"
+		p.markPassthrough(hostname, OutcomePassthroughSignFailure, reason)
+		p.recordTLSConnection(hostname, OutcomePassthroughSignFailure, false, reason, 0, nil)
+		return goproxy.OkConnect, host
+	}
+
+	_, _, _, err := getOrCreateCert(hostname, port, func() (*tls.Certificate, error) {
+		cert, _, err := p.certificateForHost(p.ca, hostname, port)
+		return cert, err
+	})
+	if err != nil {
+		reason := fmt.Sprintf("certificate issuance failed: %v", err)
+		p.Warning("cannot sign certificate for %s:%d, passing through without decryption: %s", hostname, port, err)
+		p.markPassthrough(hostname, OutcomePassthroughSignFailure, reason)
+		p.recordTLSConnection(hostname, OutcomePassthroughSignFailure, false, reason, 0, nil)
+		return goproxy.OkConnect, host
+	}
+
+	return goproxy.MitmConnect, host
 }
 
 func (p *HTTPProxy) Debug(format string, args ...interface{}) {
@@ -264,28 +336,32 @@ func (p *HTTPProxy) Configure(address string, proxyPort int, httpPort int, doRed
 
 func (p *HTTPProxy) TLSConfigFromCA(ca *tls.Certificate) func(host string, ctx *goproxy.ProxyCtx) (*tls.Config, error) {
 	return func(host string, ctx *goproxy.ProxyCtx) (c *tls.Config, err error) {
-		parts := strings.SplitN(host, ":", 2)
-		hostname := parts[0]
-		port := 443
-		if len(parts) > 1 {
-			port, err = strconv.Atoi(parts[1])
-			if err != nil {
-				port = 443
-			}
-		}
+		hostname, port := splitHostPort(host, 443)
 
-		cert := getCachedCert(hostname, port)
-		if cert == nil {
+		cert, hit, elapsed, err := getOrCreateCert(hostname, port, func() (*tls.Certificate, error) {
 			p.Info("creating spoofed certificate for %s:%d", tui.Yellow(hostname), port)
-			cert, err = btls.SignCertificateForHost(ca, hostname, port)
+			cert, _, err := p.certificateForHost(ca, hostname, port)
 			if err != nil {
 				p.Warning("cannot sign host certificate with provided CA: %s", err)
 				return nil, err
 			}
-
-			setCachedCert(hostname, port, cert)
-		} else {
+			return cert, nil
+		})
+		if err != nil {
+			return nil, err
+		}
+		if hit {
 			p.Debug("serving spoofed certificate for %s:%d", tui.Yellow(hostname), port)
+		} else if elapsed > 0 {
+			p.Debug("signed certificate for %s:%d in %s", tui.Yellow(hostname), port, elapsed.Round(time.Millisecond))
+		}
+
+		// This TLSConfig only gets used if goproxy actually starts a MITM
+		// handshake. The marker is propagated by goproxy to the per-request
+		// contexts, and onRequestFilter records the connection as decrypted on
+		// the first request that proves the client handshake succeeded.
+		if ctx != nil && p.isTLS && !p.adaptive {
+			ctx.UserData = &decryptedConnMarker{host: hostname}
 		}
 
 		config := tls.Config{
@@ -295,6 +371,14 @@ func (p *HTTPProxy) TLSConfigFromCA(ca *tls.Certificate) func(host string, ctx *
 
 		return &config, nil
 	}
+}
+
+// decryptedConnMarker lets the first request on a MITM'd connection record the
+// connection exactly once. A request can only reach the filter after the client
+// TLS handshake completed, so this is accurate evidence of decryption.
+type decryptedConnMarker struct {
+	host     string
+	recorded atomic.Bool
 }
 
 func (p *HTTPProxy) ConfigureTLS(address string, proxyPort int, httpPort int, doRedirect bool, scriptPath string,
@@ -319,6 +403,8 @@ func (p *HTTPProxy) ConfigureTLS(address string, proxyPort int, httpPort int, do
 	if ourCa.Leaf, err = x509.ParseCertificate(ourCa.Certificate[0]); err != nil {
 		return err
 	}
+	p.ca = &ourCa
+	setCertCacheCA(p.ca)
 
 	goproxy.GoproxyCa = ourCa
 	goproxy.OkConnect = &goproxy.ConnectAction{Action: goproxy.ConnectAccept, TLSConfig: p.TLSConfigFromCA(&ourCa)}
@@ -330,7 +416,8 @@ func (p *HTTPProxy) ConfigureTLS(address string, proxyPort int, httpPort int, do
 }
 
 func (p *HTTPProxy) httpWorker() error {
-	p.isRunning = true
+	p.isRunning.Store(true)
+	p.startOnce.Do(func() { close(p.started) })
 	return p.Server.ListenAndServe()
 }
 
@@ -366,8 +453,9 @@ func (p *HTTPProxy) httpsWorker() error {
 		return err
 	}
 
-	p.isRunning = true
-	for p.isRunning {
+	p.isRunning.Store(true)
+	p.startOnce.Do(func() { close(p.started) })
+	for p.isRunning.Load() {
 		c, err := p.sniListener.Accept()
 		if err != nil {
 			p.Warning("error accepting connection: %s.", err)
@@ -382,17 +470,30 @@ func (p *HTTPProxy) httpsWorker() error {
 			tlsConn, err := vhost.TLS(c)
 			if err != nil {
 				p.Warning("error reading SNI: %s.", err)
+				_ = c.Close()
 				return
 			}
 
 			hostname := tlsConn.Host()
 			if hostname == "" {
 				p.Warning("client does not support SNI.")
+				_ = c.Close()
 				return
 			}
 
 			p.Debug("proxying connection from %s to %s", tui.Bold(stripPort(c.RemoteAddr().String())), tui.Yellow(hostname))
 
+			if p.adaptive {
+				// serveAdaptive owns the connection lifetime.
+				p.serveAdaptive(tlsConn, hostname)
+				return
+			}
+
+			// goproxy's MITM path deliberately keeps serving the hijacked
+			// connection in its own goroutine after ServeHTTP returns, so the
+			// connection must not be closed here and its deadlines must be
+			// cleared now that the ClientHello has been read.
+			tlsConn.SetDeadline(time.Time{})
 			req := &http.Request{
 				Method: "CONNECT",
 				URL: &url.URL{
@@ -420,6 +521,7 @@ func (p *HTTPProxy) Start() {
 		}
 
 		p.Info("started on %s (sslstrip %s)", p.Server.Addr, strip)
+		p.prewarmCertificates()
 
 		if p.isTLS {
 			err = p.httpsWorker()
@@ -451,9 +553,12 @@ func (p *HTTPProxy) Stop() error {
 	}
 
 	p.Sess.UnkCmdCallback = nil
+	if p.Proxy != nil && p.Proxy.Tr != nil {
+		p.Proxy.Tr.CloseIdleConnections()
+	}
 
 	if p.isTLS {
-		p.isRunning = false
+		p.isRunning.Store(false)
 		p.sniListener.Close()
 		return nil
 	} else {

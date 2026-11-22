@@ -23,6 +23,12 @@ func (p *HTTPProxy) onRequestFilter(req *http.Request, ctx *goproxy.ProxyCtx) (*
 	if p.shouldProxy(req) {
 		p.Debug("< %s %s %s%s", req.RemoteAddr, req.Method, req.Host, req.URL.Path)
 
+		// Reaching the filter over a MITM'd connection means the client TLS
+		// handshake succeeded; account for the connection once.
+		if marker, ok := ctx.UserData.(*decryptedConnMarker); ok && marker.recorded.CompareAndSwap(false, true) {
+			p.recordTLSConnection(marker.host, OutcomeDecrypted, true, "", 0, nil)
+		}
+
 		p.fixRequestHeaders(req)
 
 		redir := p.Stripper.Preprocess(req, ctx)

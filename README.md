@@ -40,6 +40,9 @@ bettercap is a powerful, easily extensible and portable framework written in Go 
 * **A very convenient [web UI](https://www.bettercap.org/usage/web_ui/).**
 * [More!](https://www.bettercap.org/modules/)
 
+For HTTPS interception trust setup, adaptive passthrough, and per-site
+statistics, see [docs/https-proxy-tls.md](docs/https-proxy-tls.md).
+
 ## Contributors
 
 <a href="https://github.com/bettercap/bettercap/graphs/contributors">

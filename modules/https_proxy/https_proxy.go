@@ -1,6 +1,8 @@
 package https_proxy
 
 import (
+	"time"
+
 	"github.com/bettercap/bettercap/v2/modules/http_proxy"
 	"github.com/bettercap/bettercap/v2/session"
 	"github.com/bettercap/bettercap/v2/tls"
@@ -40,6 +42,35 @@ func NewHttpsProxy(s *session.Session) *HttpsProxy {
 	mod.AddParam(session.NewBoolParameter("https.proxy.sslstrip",
 		"false",
 		"Enable or disable SSL stripping."))
+
+	mod.AddParam(session.NewBoolParameter("https.proxy.adaptive",
+		"false",
+		"Automatically pass through connections when the client rejects the proxy CA or certificate pinning is suspected."))
+
+	mod.AddParam(session.NewIntParameter("https.proxy.passthrough.ttl",
+		"3600",
+		"Seconds to keep a host in adaptive passthrough mode before retrying MITM."))
+
+	mod.AddParam(session.NewIntParameter("https.proxy.upstream.timeout",
+		"3000",
+		"Milliseconds to wait for the upstream certificate lookup during dynamic issuance."))
+
+	mod.AddParam(session.NewStringParameter("https.proxy.prewarm",
+		"",
+		"",
+		"Comma separated hostnames whose certificates are warmed after startup (bounded by https.proxy.prewarm.max)."))
+
+	mod.AddParam(session.NewIntParameter("https.proxy.prewarm.max",
+		"32",
+		"Maximum number of hostnames accepted by https.proxy.prewarm."))
+
+	mod.AddParam(session.NewIntParameter("https.proxy.cache.size",
+		"2048",
+		"Maximum number of dynamically signed certificates kept in memory."))
+
+	mod.AddParam(session.NewIntParameter("https.proxy.cache.ttl",
+		"43200",
+		"Maximum seconds a dynamically signed certificate is cached; certificate expiry always wins."))
 
 	mod.AddParam(session.NewStringParameter("https.proxy.injectjs",
 		"",
@@ -81,6 +112,16 @@ func NewHttpsProxy(s *session.Session) *HttpsProxy {
 			return mod.Stop()
 		}))
 
+	mod.AddHandler(session.NewModuleHandler("https.proxy.stats", "[reset]",
+		"Show per-site-category TLS decryption, passthrough, client error and certificate cache statistics.",
+		func(args []string) error {
+			if len(args) > 0 && args[0] == "reset" {
+				mod.proxy.ResetHTTPSStats()
+			}
+			mod.Session.Events.Printf("%s\n", mod.proxy.HTTPSStats().String())
+			return nil
+		}))
+
 	mod.InitState("stripper")
 
 	return mod
@@ -111,6 +152,13 @@ func (mod *HttpsProxy) Configure() error {
 	var jsToInject string
 	var whitelist string
 	var blacklist string
+	var adaptive bool
+	var passthroughTTL int
+	var upstreamTimeout int
+	var prewarm string
+	var prewarmMax int
+	var cacheSize int
+	var cacheTTL int
 
 	if mod.Running() {
 		return session.ErrAlreadyStarted(mod.Name())
@@ -140,6 +188,20 @@ func (mod *HttpsProxy) Configure() error {
 		return err
 	} else if err, whitelist = mod.StringParam("https.proxy.whitelist"); err != nil {
 		return err
+	} else if err, adaptive = mod.BoolParam("https.proxy.adaptive"); err != nil {
+		return err
+	} else if err, passthroughTTL = mod.IntParam("https.proxy.passthrough.ttl"); err != nil {
+		return err
+	} else if err, upstreamTimeout = mod.IntParam("https.proxy.upstream.timeout"); err != nil {
+		return err
+	} else if err, prewarm = mod.StringParam("https.proxy.prewarm"); err != nil {
+		return err
+	} else if err, prewarmMax = mod.IntParam("https.proxy.prewarm.max"); err != nil {
+		return err
+	} else if err, cacheSize = mod.IntParam("https.proxy.cache.size"); err != nil {
+		return err
+	} else if err, cacheTTL = mod.IntParam("https.proxy.cache.ttl"); err != nil {
+		return err
 	}
 
 	mod.proxy.Blacklist = str.Comma(blacklist)
@@ -164,6 +226,14 @@ func (mod *HttpsProxy) Configure() error {
 
 	error := mod.proxy.ConfigureTLS(address, proxyPort, httpPort, doRedirect, scriptPath, certFile, keyFile, jsToInject,
 		stripSSL)
+	mod.proxy.ConfigureCertificateCache(cacheSize, time.Duration(cacheTTL)*time.Second)
+	mod.proxy.ConfigureAdaptive(
+		adaptive,
+		time.Duration(passthroughTTL)*time.Second,
+		time.Duration(upstreamTimeout)*time.Millisecond,
+		str.Comma(prewarm),
+		prewarmMax,
+	)
 
 	// save stripper to share it with other http(s) proxies
 	mod.State.Store("stripper", mod.proxy.Stripper)
